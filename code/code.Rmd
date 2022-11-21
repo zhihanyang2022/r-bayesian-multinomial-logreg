@@ -1,0 +1,371 @@
+---
+title: "Final Project by Zhihan Yang"
+---
+
+# Import
+
+```{r}
+library(runjags)
+library(bayesplot)
+library(coda)
+library(rstan)
+library(dplyr)
+library(tidybayes)
+library(tibble)
+library(caret)
+```
+
+```{r}
+# save data set as rds
+# library(palmerpenguins)
+# saveRDS(penguins, "./dataset.rds")
+```
+
+```{r}
+# load data set from rds
+penguins <- readRDS("./dataset.rds")
+```
+
+```{r}
+penguins %>% 
+  group_by(species) %>%
+  summarise(no_rows = length(species))
+```
+
+```{r}
+penguins %>% 
+  group_by(island) %>%
+  summarise(no_rows = length(island))
+```
+
+```{r}
+penguins %>% 
+  group_by(year) %>%
+  summarise(no_rows = length(year))
+```
+
+```{r}
+# only keeping columns of interest
+penguins_subset <- penguins %>% 
+  select(c("flipper_length_mm", "bill_length_mm", "species"))
+# remove rows with NAs
+cleaned <- na.omit(penguins_subset)
+nrow(cleaned)
+```
+
+# Visualize data
+
+```{r}
+ggplot(data = cleaned, aes(x = bill_length_mm, y = flipper_length_mm)) +
+  geom_point(aes(color = species, 
+                 shape = species),
+             size = 2) +
+  scale_color_manual(values = c("darkorange","darkorchid","cyan4")) +
+  theme(aspect.ratio=1) + 
+  xlab("Bill length (mm)") + 
+  ylab("Flipper length (mm)") + 
+  labs(color='Species', shape='Species')
+```
+
+# Stratified train-test split
+
+```{r}
+# https://stackoverflow.com/questions/20776887/stratified-splitting-the-data
+set.seed(42)
+train.index <- createDataPartition(cleaned$species, p=.7, list=F)
+train <- cleaned[ train.index,]
+test  <- cleaned[-train.index,]
+nrow(train)
+```
+
+```{r}
+train.predictor <- select(train, c("flipper_length_mm", "bill_length_mm"))
+train.predictor$one <- 1
+train.response <- as.numeric(train$species)
+
+test.predictor <- select(test, c("flipper_length_mm", "bill_length_mm"))
+test.predictor$one <- 1
+test.response <- as.numeric(test$species)
+```
+
+# Normalize data for easier convergence
+
+```{r}
+# compute statistics on training set
+train.flipper_length.mean <- mean(train.predictor$flipper_length_mm)
+train.flipper_length.sd <- sd(train.predictor$flipper_length_mm)
+train.bill_length.mean <- mean(train.predictor$bill_length_mm)
+train.bill_length.sd <- sd(train.predictor$bill_length_mm)
+
+# normalize training set
+train.predictor$flipper_length_mm = (train.predictor$flipper_length_mm - train.flipper_length.mean) / train.flipper_length.sd
+train.predictor$bill_length_mm = (train.predictor$bill_length_mm - train.bill_length.mean) / train.bill_length.sd
+
+# normalize testing set (using training set statistics)
+test.predictor$flipper_length_mm = (test.predictor$flipper_length_mm - train.flipper_length.mean) / train.flipper_length.sd
+test.predictor$bill_length_mm = (test.predictor$bill_length_mm - train.bill_length.mean) / train.bill_length.sd
+```
+
+# Visualize normalized data
+
+```{r}
+ggplot(data = train.predictor, aes(x = bill_length_mm, y = flipper_length_mm)) +
+  geom_point(aes(color = train$species, 
+                 shape = train$species),
+             size = 2) +
+  scale_color_manual(values = c("darkorange","darkorchid","cyan4")) +
+  theme(aspect.ratio=1) + 
+  xlab("Bill length (standardized)") + 
+  ylab("Flipper length (standardized)") + 
+  labs(color='Species', shape='Species')
+```
+
+```{r}
+ggplot(data = test.predictor, aes(x = bill_length_mm, y = flipper_length_mm)) +
+  geom_point(aes(color = test$species, 
+                 shape = test$species),
+             size = 2) +
+  scale_color_manual(values = c("darkorange","darkorchid","cyan4")) + 
+  theme(aspect.ratio=1) + 
+  xlab("Bill length (standardized)") + 
+  ylab("Flipper length (standardized)") + 
+  labs(color='Species', shape='Species')
+```
+
+# Model declaration
+
+```{r}
+modelString <- "model{
+
+# likelihood
+
+for (i in 1:n) {
+  y[i] ~ dcat(pis[i, ])
+  
+  for (j in 1:3) {
+    pis[i, j] <- exponentiated_logits[i, j] / sum(exponentiated_logits[i, ])
+  }
+  
+  for (j in 1:3) {
+    exponentiated_logits[i, j] <- exp(logits[i, j])
+  }
+  
+  logits[i, 1] <- 0
+  logits[i, 2] <- b0_chinstrap + b1_chinstrap * flipper_length[i] + b2_chinstrap * bill_length[i]
+  logits[i, 3] <- b0_gentoo + b1_gentoo * flipper_length[i] + b2_gentoo * bill_length[i]
+}
+
+# priors
+
+b0_chinstrap ~ dnorm(0, 1/100)
+b1_chinstrap ~ dnorm(0, 1/100)
+b2_chinstrap ~ dnorm(0, 1/100)
+
+b0_gentoo ~ dnorm(0, 1/100)
+b1_gentoo ~ dnorm(0, 1/100)
+b2_gentoo ~ dnorm(0, 1/100)
+
+}
+"
+```
+
+```{r}
+posterior <- run.jags(
+  model=modelString,
+  n.chains=3,
+  data=list(
+    n=nrow(train.predictor),
+    flipper_length=train.predictor$flipper_length_mm,
+    bill_length=train.predictor$bill_length_mm,
+    y=train.response
+  ),
+  monitor=c("b0_chinstrap", "b1_chinstrap", "b2_chinstrap", "b0_gentoo", "b1_gentoo", "b2_gentoo"),
+  adapt=10000,
+  burnin=10000,
+  sample=10000,
+  thin=5
+)
+```
+
+```{r}
+mcmc_trace(as.mcmc.list(posterior))
+```
+
+```{r}
+mcmc_acf(as.mcmc.list(posterior))
+```
+
+
+# Save the samples
+
+```{r}
+post_draws <- tidy_draws(posterior)
+```
+
+```{r}
+# saveRDS(post_draws, "./post_draws.rds")
+```
+
+```{r}
+# post_draws <- readRDS("./post_draws.rds")
+# nrow(post_draws)
+```
+
+# Important function
+
+```{r}
+get_prob_draws_at_predictor_values <- function(predictor_values, chinstrap.params, gentoo.params) {
+  
+  adelie.logits <- matrix(0, nrow(predictor_values), nrow(chinstrap.params))
+  
+  # matrix multiplication shape: (N, D) * (D, S) => (N, S)
+  # N: number of data points
+  # D: number of features
+  # S: number of posterior samples
+  
+  chinstrap.logits <- as.matrix(predictor_values) %*% t(chinstrap.params)
+  gentoo.logits <- as.matrix(predictor_values) %*% t(gentoo.params)
+
+  adelie.logits.exp <- exp(adelie.logits)
+  chinstrap.logits.exp <- exp(chinstrap.logits)
+  gentoo.logits.exp <- exp(gentoo.logits)
+
+  denom <- adelie.logits.exp + chinstrap.logits.exp + gentoo.logits.exp
+  
+  adelie.probs <- adelie.logits.exp / denom
+  chinstrap.probs <- chinstrap.logits.exp / denom
+  gentoo.probs <- gentoo.logits.exp / denom
+  
+  list(
+    adelie=adelie.probs,
+    chinstrap=chinstrap.probs,
+    gentoo=gentoo.probs
+  )
+  
+}
+```
+
+```{r}
+chinstrap.params <- post_draws %>%
+  select(c("b1_chinstrap", "b2_chinstrap", "b0_chinstrap"))
+gentoo.params <- post_draws %>%
+  select(c("b1_gentoo", "b2_gentoo", "b0_gentoo"))
+```
+
+# Posterior predictive check (via reclassification)
+
+```{r}
+probs <- get_prob_draws_at_predictor_values(train.predictor, chinstrap.params, gentoo.params)
+dim(probs$adelie)
+```
+
+```{r}
+reclassified.species <- character(nrow(train))
+for (i in 1:nrow(train)) {
+  random_col_index <- sample(ncol(probs$adelie), size=1)
+  reclassified.species[i] <- sample(
+    c("Adelie", "Chinstrap", "Gentoo"), 
+    size=1, 
+    prob=c(probs$adelie[i, random_col_index], probs$chinstrap[i, random_col_index], probs$gentoo[i, random_col_index])
+  )
+}
+
+ggplot(data = train.predictor, aes(x = bill_length_mm, y = flipper_length_mm)) +
+  geom_point(aes(color = reclassified.species, 
+                 shape = reclassified.species),
+             size = 2) +
+  scale_color_manual(values = c("darkorange","darkorchid","cyan4")) + 
+  theme(aspect.ratio=1) + 
+  xlab("Bill length (standardized)") + 
+  ylab("Flipper length (standardized)") + 
+  theme(legend.position="none")
+```
+
+# Parameter inference
+
+```{r}
+mcmc_areas(
+  post_draws, 
+  pars=c(
+    "b0_chinstrap", "b1_chinstrap", "b2_chinstrap",
+    "b0_gentoo", "b1_gentoo", "b2_gentoo"
+  )
+)
+```
+
+```{r}
+apply(post_draws, 2, quantile, probs = c(0.025))
+```
+
+```{r}
+apply(post_draws, 2, quantile, probs = c(0.975))
+```
+
+# Posterior predictive prob surface for each class
+
+```{r}
+# create a fine grid of points
+x.grid <- expand.grid( 
+  x1 = seq(-4, 4, length=60), 
+  x2 = seq(-4, 4, length=60) 
+)
+x.grid.one <- cbind(x.grid, 1)
+```
+
+```{r}
+probs <- get_prob_draws_at_predictor_values(x.grid.one, chinstrap.params, gentoo.params)
+dim(probs$adelie)
+```
+
+```{r}
+data_to_plot <- x.grid
+data_to_plot$adelie.mean <- apply(probs$adelie, 1, mean)
+data_to_plot$chinstrap.mean <- apply(probs$chinstrap, 1, mean)
+data_to_plot$gentoo.mean <- apply(probs$gentoo, 1, mean)
+# data_to_plot$diff <- apply(probs$adelie, 1, IQR)
+```
+
+```{r}
+ggplot() +
+  geom_contour_filled(
+    data=data_to_plot, 
+    aes(x=x2, y=x1, z=adelie.mean)
+  ) + 
+  xlim(-4, 4) + 
+  ylim(-4, 4) + 
+  geom_point(
+    data=train.predictor, 
+    aes(
+      x = bill_length_mm, 
+      y = flipper_length_mm, 
+      color = train$species, 
+      shape = train$species
+    ),
+    size = 1.5) +
+  scale_color_manual(values = c("darkorange","darkorchid","cyan4")) + 
+  theme(aspect.ratio=1) + 
+  xlab("Bill length (standardized)") + 
+  ylab("Flipper length (standardized)") + 
+  labs(color='Species', shape='Species')
+```
+
+# Prediction on test set
+
+```{r}
+probs <- get_prob_draws_at_predictor_values(test.predictor, chinstrap.params, gentoo.params)
+dim(probs$adelie)
+```
+
+```{r}
+# posterior predictive at each x_i (test)
+post.pred <- data.frame(
+  adelie <- apply(probs$adelie, 1, mean),
+  chinstrap <- apply(probs$chinstrap, 1, mean),
+  gentoo <- apply(probs$gentoo, 1, mean)
+)
+```
+
+```{r}
+# test accuracy
+mean(max.col(post.pred) == test.response)
+```
