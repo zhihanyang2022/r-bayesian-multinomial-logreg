@@ -1,2 +1,3 @@
-# r-bayesian-multinomial-logreg
-Bayesian multinomial logistic regression implemented in R.
+# Bayesian multinomial logistic regression in R
+
+
